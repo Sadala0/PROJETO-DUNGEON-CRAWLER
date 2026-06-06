@@ -1,0 +1,805 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <conio.h>
+  #define CLEAR_CMD "cls"
+  static char read_key(void) { return (char)_getch(); }
+  static void term_raw(void)     { /* nao necessario no Windows */ }
+  static void term_restore(void) { /* nao necessario no Windows */ }
+#else
+  #include <termios.h>
+  #include <unistd.h>
+  #define CLEAR_CMD "clear"
+  static struct termios orig_termios;
+  static void term_raw(void) {
+      struct termios raw = orig_termios;
+      raw.c_lflag &= ~(ICANON | ECHO);
+      raw.c_cc[VMIN]  = 1;
+      raw.c_cc[VTIME] = 0;
+      tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+  }
+  static void term_restore(void) {
+      tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+  }
+  static char read_key(void) {
+      char c = 0;
+      if (read(STDIN_FILENO, &c, 1) == 1) return c;
+      return 0;
+  }
+#endif
+
+/* ========================== CONSTANTES ========================== */
+#define MAX_ROWS     25
+#define MAX_COLS     25
+#define MAX_MONSTERS 20
+
+/* Simbolos */
+#define SYM_WALL    '*'
+#define SYM_SPIKE   '#'
+#define SYM_BOX     'k'
+#define SYM_BUTTON  'O'
+#define SYM_DOOR_C  'D'
+#define SYM_DOOR_O  '='
+#define SYM_KEY     '@'
+#define SYM_STAIR   'L'
+#define SYM_MON1    'X'
+#define SYM_MON2    'Y'
+#define SYM_BOSS    'Z'
+#define SYM_EMPTY   ' '
+#define SYM_NPC     'N'
+
+/* Direcoes */
+#define DIR_UP    0
+#define DIR_DOWN  1
+#define DIR_LEFT  2
+#define DIR_RIGHT 3
+
+/* Armas */
+#define WPN_NONE   -1
+#define WPN_SWORD   0
+#define WPN_BOW     1
+#define WPN_STAFF   2
+
+/* Fases */
+#define PHASE_VILA  0
+#define PHASE_F1    1
+#define PHASE_F2    2
+#define PHASE_F3    3
+
+/* ========================== STRUCTS ========================== */
+typedef struct {
+    int row, col;
+    int dir;
+    int lives;
+    int weapon;
+    int keys_count;
+} Player;
+
+typedef struct {
+    int row, col;
+    int type;       /* 1=X aleat, 2=Y perseg, 3=Z boss */
+    int alive;
+    int hp;
+    int boss_phase;
+    int boss_timer;
+    int summon_cd;
+} Monster;
+
+typedef struct {
+    char    grid[MAX_ROWS][MAX_COLS];
+    int     rows, cols;
+    Monster monsters[MAX_MONSTERS];
+    int     mon_count;
+    int     keys_collected;
+    int     total_keys;
+    int     boss_dead;
+    int     start_row, start_col;
+} Map;
+
+/* ========================== GLOBAIS ========================== */
+static Player player;
+static Map    cur_map;
+static int    phase;
+
+/* ========================== UTILITARIOS ========================== */
+static void clear_screen(void) {
+    system(CLEAR_CMD);
+}
+
+static void print_center(const char *text, int width) {
+    int len = (int)strlen(text);
+    int pad = (width - len) / 2;
+    if (pad < 0) pad = 0;
+    printf("%*s%s\n", pad, "", text);
+}
+
+static void press_any_key(void) {
+    printf("\n  Pressione qualquer tecla para continuar...");
+    fflush(stdout);
+    term_restore();
+    read_key();
+    term_raw();
+}
+
+/* ========================== DESENHO ========================== */
+static char player_char(int dir) {
+    switch (dir) {
+        case DIR_UP:    return '^';
+        case DIR_DOWN:  return 'v';
+        case DIR_LEFT:  return '<';
+        case DIR_RIGHT: return '>';
+    }
+    return '>';
+}
+
+static void draw_map(void) {
+    clear_screen();
+
+    /* --- HUD --- */
+    const char *wpn = "---";
+    if (player.weapon == WPN_SWORD) wpn = "Espada";
+    else if (player.weapon == WPN_BOW)   wpn = "Arco";
+    else if (player.weapon == WPN_STAFF) wpn = "Cajado";
+
+    const char *pname = "Vila";
+    if (phase == PHASE_F1) pname = "Masmorra - Andar 1";
+    else if (phase == PHASE_F2) pname = "Masmorra - Andar 2";
+    else if (phase == PHASE_F3) pname = "Masmorra - Andar 3";
+
+    printf("  [ %-20s ]  Vidas: ", pname);
+    for (int i = 0; i < 3; i++) printf(i < player.lives ? "* " : ". ");
+    printf(" Arma: %-10s Chaves: %d/%d\n",
+           wpn, player.keys_count, cur_map.total_keys);
+
+    /* borda superior */
+    printf("  +");
+    for (int c = 0; c < cur_map.cols; c++) printf("-");
+    printf("+\n");
+
+    for (int r = 0; r < cur_map.rows; r++) {
+        printf("  |");
+        for (int c = 0; c < cur_map.cols; c++) {
+            if (r == player.row && c == player.col)
+                putchar(player_char(player.dir));
+            else
+                putchar(cur_map.grid[r][c]);
+        }
+        printf("|\n");
+    }
+
+    /* borda inferior */
+    printf("  +");
+    for (int c = 0; c < cur_map.cols; c++) printf("-");
+    printf("+\n");
+
+    printf("  [wasd] Mover  [i] Interagir  [o] Atacar  [q] Menu\n");
+    fflush(stdout);
+}
+
+/* ========================== MAPAS ========================== */
+static void mon_add(Map *m, int row, int col, int type) {
+    if (m->mon_count >= MAX_MONSTERS) return;
+    Monster *mn  = &m->monsters[m->mon_count++];
+    mn->row      = row;
+    mn->col      = col;
+    mn->type     = type;
+    mn->alive    = 1;
+    mn->hp = (type == 3) ? 3 : 1;
+    mn->boss_phase = 1;
+    mn->boss_timer = 0;
+    mn->summon_cd  = 0;
+    char sym = (type == 1) ? SYM_MON1 : (type == 2) ? SYM_MON2 : SYM_BOSS;
+    m->grid[row][col] = sym;
+}
+
+static void map_load(Map *m, int rows, int cols,
+                     const char *tmpl[], int nrows) {
+    m->rows = rows;
+    m->cols = cols;
+    m->mon_count      = 0;
+    m->keys_collected = 0;
+    m->boss_dead      = 0;
+    for (int r = 0; r < rows; r++) {
+        int tlen = (r < nrows) ? (int)strlen(tmpl[r]) : 0;
+        for (int c = 0; c < cols; c++) {
+            char ch = (c < tlen) ? tmpl[r][c] : SYM_EMPTY;
+            m->grid[r][c] = ch;
+        }
+    }
+}
+
+/* VILA */
+static void build_vila(Map *m) {
+    const char *t[] = {
+        "**********",
+        "*        *",
+        "* N      *",
+        "*        *",
+        "*        *",
+        "*        *",
+        "*        *",
+        "*        *",
+        "*       L*",
+        "**********",
+    };
+    map_load(m, 10, 10, t, 10);
+    m->total_keys  = 0;
+    m->start_row   = 1;
+    m->start_col   = 1;
+}
+
+/* ANDAR 1 */
+static void build_floor1(Map *m) {
+    const char *t[] = {
+        "**********",
+        "*        *",
+        "******   *",
+        "***@  k  *",
+        "***   k  *",
+        "****D*** *",
+        "*        *",
+        "*kkkkkkkk*",
+        "*       L*",
+        "**********",
+    };
+    map_load(m, 10, 10, t, 10);
+    m->total_keys  = 1;
+    m->start_row   = 1;
+    m->start_col   = 1;
+}
+
+/* ANDAR 2 */
+static void build_floor2(Map *m) {
+    const char *t[] = {
+        "***************",
+        "*             *",
+        "*##########   *",
+        "*      @  #   *",
+        "*         #   *",
+        "*kkk#######   *",
+        "*             *",
+        "*             *",
+        "*             *",
+        "*          #D#*",
+        "*          #@#*",
+        "*          #O#*",
+        "*#####*********",
+        "*         D  L*",
+        "***************",
+    };
+    map_load(m, 15, 15, t, 15);
+    m->total_keys  = 2;
+    m->start_row   = 1;
+    m->start_col   = 1;
+    mon_add(m,  9,  4, 1);
+    mon_add(m,  9, 10, 1);
+}
+
+/* ANDAR 3 */
+  static void build_floor3(Map *m) {
+    const char *t[] = {
+        "*************************",
+        "*        *######@       *",
+        "*        *###########   *",
+        "*        D              *",
+        "*kkkkkkkk*              *",
+        "*      @ *              *",
+        "*####################   *",
+        "*                       *",
+        "*     Y                 *",
+        "*                       *",
+        "*          @            *",
+        "*                       *",
+        "*                       *",
+        "*                       *",
+        "* *********D*********** *",
+        "*                       *",
+        "*                       *",
+        "*         Z             *",
+        "*                       *",
+        "*                       *",
+        "*                       *",
+        "*                       *",
+        "*                    *D *",
+        "*                    *L *",
+        "*************************"
+    };
+
+    map_load(m, 25, 25, t, 25);
+
+    m->total_keys = 3;
+    m->start_row = 1;
+    m->start_col = 1;
+
+    mon_add(m, 8, 6, 2);      /* Y */
+    mon_add(m, 7, 6, 2);      /* Y */
+    mon_add(m, 7, 6, 2);      /* Y */
+
+/* Monstros X */
+mon_add(m, 10, 15, 1);
+mon_add(m, 12, 5, 1);
+mon_add(m, 19, 18, 1);
+
+mon_add(m, 17, 10, 3);    /* Boss */
+    mon_add(m, 17, 10, 3);    /* Boss 2 */
+}
+
+
+
+
+static void init_phase(int ph) {
+    phase = ph;
+    switch (ph) {
+        case PHASE_VILA: build_vila(&cur_map);   break;
+        case PHASE_F1:   build_floor1(&cur_map); break;
+        case PHASE_F2:   build_floor2(&cur_map); break;
+        case PHASE_F3:   build_floor3(&cur_map); break;
+    }
+    player.row        = cur_map.start_row;
+    player.col        = cur_map.start_col;
+    player.dir        = DIR_RIGHT;
+    player.keys_count = 0;
+}
+
+/* ========================== ATAQUE ========================== */
+static int in_bounds(int r, int c) {
+    return r >= 0 && r < cur_map.rows && c >= 0 && c < cur_map.cols;
+}
+
+static void attack_cell(int r, int c) {
+    if (!in_bounds(r, c)) return;
+    char cell = cur_map.grid[r][c];
+    if (cell == SYM_BOX) {
+        cur_map.grid[r][c] = SYM_EMPTY;
+        return;
+    }
+    for (int i = 0; i < cur_map.mon_count; i++) {
+        Monster *mn = &cur_map.monsters[i];
+        if (!mn->alive || mn->row != r || mn->col != c) continue;
+        mn->hp--;
+        if (mn->hp <= 0) {
+            mn->alive = 0;
+            cur_map.grid[r][c] = SYM_EMPTY;
+            if (mn->type == 3) {
+                cur_map.boss_dead = 1;
+                /* Desbloqueia escada */
+                cur_map.grid[22][20] = SYM_STAIR;
+            }
+        }
+        return;
+    }
+}
+
+static void do_attack(void) {
+    int pr = player.row, pc = player.col, dir = player.dir;
+
+    if (player.weapon == WPN_STAFF) {
+        int dr, dc;
+        for (dr = -1; dr <= 1; dr++)
+            for (dc = -1; dc <= 1; dc++)
+                if (dr != 0 || dc != 0)
+                    attack_cell(pr + dr, pc + dc);
+        return;
+    }
+
+    if (player.weapon == WPN_BOW) {
+        int dr = 0, dc = 0;
+        if      (dir == DIR_UP)    dr = -1;
+        else if (dir == DIR_DOWN)  dr =  1;
+        else if (dir == DIR_LEFT)  dc = -1;
+        else                       dc =  1;
+        for (int s = 1; s <= 4; s++) {
+            int nr = pr + dr * s, nc = pc + dc * s;
+            if (!in_bounds(nr, nc)) break;
+            attack_cell(nr, nc);
+            char ch = cur_map.grid[nr][nc];
+            if (ch == SYM_WALL) break;
+        }
+        return;
+    }
+
+    /* Espada: 3x2 a frente */
+    int cells[6][2];
+    int n = 0;
+    if (dir == DIR_UP) {
+        cells[n][0]=-1; cells[n++][1]=-1;
+        cells[n][0]=-1; cells[n++][1]= 0;
+        cells[n][0]=-1; cells[n++][1]= 1;
+        cells[n][0]=-2; cells[n++][1]=-1;
+        cells[n][0]=-2; cells[n++][1]= 0;
+        cells[n][0]=-2; cells[n++][1]= 1;
+    } else if (dir == DIR_DOWN) {
+        cells[n][0]= 1; cells[n++][1]=-1;
+        cells[n][0]= 1; cells[n++][1]= 0;
+        cells[n][0]= 1; cells[n++][1]= 1;
+        cells[n][0]= 2; cells[n++][1]=-1;
+        cells[n][0]= 2; cells[n++][1]= 0;
+        cells[n][0]= 2; cells[n++][1]= 1;
+    } else if (dir == DIR_LEFT) {
+        cells[n][0]=-1; cells[n++][1]=-1;
+        cells[n][0]= 0; cells[n++][1]=-1;
+        cells[n][0]= 1; cells[n++][1]=-1;
+        cells[n][0]=-1; cells[n++][1]=-2;
+        cells[n][0]= 0; cells[n++][1]=-2;
+        cells[n][0]= 1; cells[n++][1]=-2;
+    } else {
+        cells[n][0]=-1; cells[n++][1]= 1;
+        cells[n][0]= 0; cells[n++][1]= 1;
+        cells[n][0]= 1; cells[n++][1]= 1;
+        cells[n][0]=-1; cells[n++][1]= 2;
+        cells[n][0]= 0; cells[n++][1]= 2;
+        cells[n][0]= 1; cells[n++][1]= 2;
+    }
+    for (int i = 0; i < n; i++)
+        attack_cell(pr + cells[i][0], pc + cells[i][1]);
+}
+
+/* ========================== INTERACAO ========================== */
+static void do_interact(void) {
+    int fr = player.row, fc = player.col;
+    if      (player.dir == DIR_UP)    fr--;
+    else if (player.dir == DIR_DOWN)  fr++;
+    else if (player.dir == DIR_LEFT)  fc--;
+    else                              fc++;
+
+    if (!in_bounds(fr, fc)) return;
+    char cell = cur_map.grid[fr][fc];
+
+    if (cell == SYM_KEY) {
+        cur_map.grid[fr][fc] = SYM_EMPTY;
+        player.keys_count++;
+        cur_map.keys_collected++;
+        return;
+    }
+    if (cell == SYM_DOOR_C && player.keys_count > 0) {
+        cur_map.grid[fr][fc] = SYM_DOOR_O;
+        player.keys_count--;
+        return;
+    }
+    if (cell == SYM_BUTTON) {
+        cur_map.grid[fr][fc] = SYM_EMPTY;
+        /* Efeito: abre passagem no andar 2 */
+       if (phase == PHASE_F2) {
+    for (int c = 1; c <= 5; c++) {
+        cur_map.grid[12][c] = SYM_EMPTY;
+    }
+}
+        /* Efeito andar 3: invoca monstro */
+        if (phase == PHASE_F3)
+            mon_add(&cur_map, player.row + 2, player.col + 2, 1);
+        return;
+    }
+    /* NPC na Vila: escolha de arma */
+    if (cell == SYM_NPC && phase == PHASE_VILA) {
+        term_restore();
+        clear_screen();
+        printf("\n\n");
+        print_center("=== Ferreiro Aldric ===", 50);
+        printf("\n");
+        printf("  \"Aventureiro! A masmorra e perigosa.\n");
+        printf("   Escolha sua arma com sabedoria!\"\n\n");
+        printf("  1. Espada  - Ataca regiao 3x2 a frente\n");
+        printf("  2. Arco    - Ataca 4 celulas em linha reta\n");
+        printf("  3. Cajado  - Ataca todas 8 celulas adjacentes\n\n");
+        printf("  Escolha [1/2/3]: ");
+        fflush(stdout);
+        term_raw();
+        char ch;
+        do { ch = read_key(); } while (ch != '1' && ch != '2' && ch != '3');
+        if (ch == '1') player.weapon = WPN_SWORD;
+        else if (ch == '2') player.weapon = WPN_BOW;
+        else player.weapon = WPN_STAFF;
+        return;
+    }
+}
+
+/* ========================== IA DOS MONSTROS ========================== */
+static int cell_walkable(int r, int c) {
+    if (!in_bounds(r, c)) return 0;
+    char ch = cur_map.grid[r][c];
+    return ch == SYM_EMPTY || ch == SYM_DOOR_O;
+}
+
+static int mon_at(int r, int c, Monster *skip) {
+    int i;
+    for (i = 0; i < cur_map.mon_count; i++) {
+        Monster *m = &cur_map.monsters[i];
+        if (!m->alive || m == skip) continue;
+        if (m->row == r && m->col == c) return 1;
+    }
+    return 0;
+}
+
+static void mon_move(Monster *mn, int nr, int nc, char sym) {
+    if (!in_bounds(nr, nc)) return;
+    if (!cell_walkable(nr, nc)) return;
+    if (mon_at(nr, nc, mn)) return;
+    cur_map.grid[mn->row][mn->col] = SYM_EMPTY;
+    mn->row = nr;
+    mn->col = nc;
+    cur_map.grid[nr][nc] = sym;
+}
+
+static void move_type1(Monster *mn) {
+    int dr[] = {-1, 1, 0, 0};
+    int dc[] = { 0, 0,-1, 1};
+    int d = rand() % 4;
+    int tries = 0;
+    while (tries++ < 8) {
+        int nr = mn->row + dr[d], nc = mn->col + dc[d];
+        if (cell_walkable(nr, nc) && !mon_at(nr, nc, mn)) {
+            mon_move(mn, nr, nc, SYM_MON1);
+            return;
+        }
+        d = rand() % 4;
+    }
+}
+
+static void move_type2(Monster *mn) {
+    int dr = player.row - mn->row;
+    int dc = player.col - mn->col;
+    int nr = mn->row, nc = mn->col;
+    if (abs(dr) >= abs(dc))
+        nr += (dr > 0) ? 1 : -1;
+    else
+        nc += (dc > 0) ? 1 : -1;
+    mon_move(mn, nr, nc, SYM_MON2);
+}
+
+/*
+ * BOSS - "Senhor das Sombras"
+ */
+static void move_boss(Monster *mn) {
+    int dr = player.row - mn->row;
+    int dc = player.col - mn->col;
+
+    int nr = mn->row;
+    int nc = mn->col;
+
+    if (abs(dr) >= abs(dc))
+        nr += (dr > 0) ? 1 : -1;
+    else
+        nc += (dc > 0) ? 1 : -1;
+
+    mon_move(mn, nr, nc, SYM_BOSS);
+}
+
+static void update_monsters(void) {
+    int i;
+    for (i = 0; i < cur_map.mon_count; i++) {
+        Monster *mn = &cur_map.monsters[i];
+        if (!mn->alive) continue;
+        switch (mn->type) {
+            case 1: move_type1(mn); break;
+            case 2: move_type2(mn); break;
+            case 3: move_boss(mn);  break;
+        }
+    }
+}
+
+/* ========================== VERIFICACOES ========================== */
+static int is_blocked(int r, int c) {
+    if (!in_bounds(r, c)) return 1;
+    char ch = cur_map.grid[r][c];
+    return ch == SYM_WALL || ch == SYM_BOX || ch == SYM_DOOR_C || ch == SYM_NPC;
+}
+
+static int player_dead(void) {
+    if (cur_map.grid[player.row][player.col] == SYM_SPIKE) return 1;
+    int i;
+    for (i = 0; i < cur_map.mon_count; i++) {
+        Monster *mn = &cur_map.monsters[i];
+        if (mn->alive && mn->row == player.row && mn->col == player.col)
+            return 1;
+    }
+    return 0;
+}
+
+/* ========================== TELAS ========================== */
+static void show_game_over(void) {
+    term_restore();
+    clear_screen();
+    printf("\n\n\n");
+    print_center("+==========================+", 60);
+    print_center("|        GAME  OVER        |", 60);
+    print_center("+==========================+", 60);
+    printf("\n");
+    print_center("Voce foi derrotado...", 60);
+    print_center("A escuridao consome a masmorra.", 60);
+    press_any_key();
+}
+
+static void show_victory(void) {
+    term_restore();
+    clear_screen();
+    printf("\n\n");
+    print_center("* * * * * * * * * * * * * * *", 60);
+    print_center("         VITORIA!            ", 60);
+    print_center("* * * * * * * * * * * * * * *", 60);
+    printf("\n\n");
+    printf("  A masmorra treme. A escuridao recua.\n\n");
+    print_center("     Obrigado por jogar!      ", 60);
+    print_center("      DUNGEON CRAWLER         ", 60);
+    printf("\n");
+    press_any_key();
+}
+
+static void show_tutorial(void) {
+    term_restore();
+    clear_screen();
+    printf("\n");
+    print_center("=== TUTORIAL ===", 60);
+    printf("\n");
+    printf("  HISTORIA:\n");
+    printf("  O reino de Belem foi tomado pelo Senhor das Sombras.\n");
+    printf("  Voce e a ultima esperanca do reino!\n\n");
+    printf("  CONTROLES:\n");
+    printf("  w / a / s / d  - Mover (cima/esq/baixo/dir)\n");
+    printf("  i              - Interagir com objeto a frente\n");
+    printf("  o              - Atacar\n");
+    printf("  q              - Voltar ao menu\n\n");
+    printf("  SIMBOLOS:\n");
+    printf("  ^ v < >  Jogador (direcao)\n");
+    printf("  *        Parede (intransponivel)\n");
+    printf("  #        Espinho (mata ao pisar)\n");
+    printf("  k        Caixa (destruivel com ataque)\n");
+    printf("  O        Botao (pressione [i])\n");
+    printf("  D        Porta fechada\n");
+    printf("  =        Porta aberta\n");
+    printf("  @        Chave (pegar com [i])\n");
+    printf("  L        Escada (proxima fase)\n");
+    printf("  N        NPC\n");
+    printf("  X        Monstro Tipo 1 (aleatorio)\n");
+    printf("  Y        Monstro Tipo 2 (perseguicao)\n");
+    printf("  Z        Boss Final\n\n");
+    printf("  ARMAS:\n");
+    printf("  Espada  - 3x2 celulas a frente\n");
+    printf("  Arco    - 4 celulas em linha reta\n");
+    printf("  Cajado  - 8 celulas adjacentes\n\n");
+    press_any_key();
+}
+
+static void show_credits(void) {
+    term_restore();
+    clear_screen();
+    printf("\n\n");
+    print_center("=== CREDITOS ===", 60);
+    printf("\n");
+    print_center("DUNGEON CRAWLER", 60);
+    printf("\n");
+    printf("  Desenvolvido como projeto academico.\n\n");
+    printf("  Desenvolvedores:\n");
+    printf("    - [Lucas Sadala]\n");
+    printf("  Obrigado por jogar!\n\n");
+    press_any_key();
+}
+
+/* ========================== MENU ========================== */
+static int show_menu(void) {
+    term_restore();
+    while (1) {
+        clear_screen();
+        printf("\n\n\n");
+        print_center("+================================+", 60);
+        print_center("|      DUNGEON  CRAWLER          |", 60);
+        print_center("|                                |", 60);
+        print_center("+================================+", 60);
+        printf("\n\n");
+        print_center("1. Jogar", 60);
+        print_center("2. Tutorial", 60);
+        print_center("3. Sair / Creditos", 60);
+        printf("\n");
+        print_center("Escolha [1/2/3]: ", 60);
+        fflush(stdout);
+        term_raw();
+        char ch = read_key();
+        if (ch == '1') { term_raw(); return 1; }
+        if (ch == '2') { show_tutorial(); term_raw(); }
+        if (ch == '3') { show_credits(); term_restore(); return 0; }
+    }
+}
+
+/* ========================== LOOP PRINCIPAL ========================== */
+/* Retorna: 0=game over, 1=avancar fase, -1=menu/vitoria */
+static int game_loop(void) {
+    while (1) {
+        update_monsters();
+
+        if (player_dead()) {
+            player.lives--;
+            if (player.lives <= 0) {
+                show_game_over();
+                return 0;
+            }
+            /* reinicia fase mantendo vidas e arma */
+            int ph  = phase;
+            int wep = player.weapon;
+            int lv  = player.lives;
+            init_phase(ph);
+            player.weapon = wep;
+            player.lives  = lv;
+            continue;
+        }
+
+        draw_map();
+
+        char key = read_key();
+        if (key == 'q') return -1;
+
+        int nr = player.row, nc = player.col;
+        int moved = 0;
+
+        if      (key == 'w') { player.dir = DIR_UP;    nr--; moved = 1; }
+        else if (key == 's') { player.dir = DIR_DOWN;  nr++; moved = 1; }
+        else if (key == 'a') { player.dir = DIR_LEFT;  nc--; moved = 1; }
+        else if (key == 'd') { player.dir = DIR_RIGHT; nc++; moved = 1; }
+        else if (key == 'i') { do_interact(); }
+        else if (key == 'o') { do_attack(); }
+
+        if (moved && !is_blocked(nr, nc)) {
+            player.row = nr;
+            player.col = nc;
+            char cell = cur_map.grid[player.row][player.col];
+
+            if (cell == SYM_STAIR) {
+                /* Vila: so avanca se escolheu arma */
+                if (phase == PHASE_VILA && player.weapon == WPN_NONE) {
+                    /* nao avanca sem arma */
+                } else if (phase == PHASE_F3 && cur_map.boss_dead) {
+                    show_victory();
+                    return -1;
+                } else if (phase != PHASE_F3) {
+                    return 1;
+                }
+            }
+        }
+    }
+}
+
+/* ========================== MAIN ========================== */
+int main(void) {
+    srand((unsigned int)time(NULL));
+
+#ifndef _WIN32
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    atexit(term_restore);
+#endif
+
+    while (1) {
+        int choice = show_menu();
+        if (choice == 0) break;
+
+        player.lives  = 3;
+        player.weapon = WPN_NONE;
+        player.keys_count = 0;
+
+        init_phase(PHASE_VILA);
+        term_raw();
+
+        int cur_phase = PHASE_VILA;
+
+        while (1) {
+            int result = game_loop();
+            if (result <= 0) break;  /* 0=game over, -1=menu/vitoria */
+            /* Avanca de fase */
+            cur_phase++;
+            if (cur_phase > PHASE_F3) break;
+            int wep  = player.weapon;
+            int lv   = player.lives;
+            init_phase(cur_phase);
+            player.weapon = wep;
+            player.lives  = lv;
+        }
+
+        term_restore();
+    }
+
+    clear_screen();
+    printf("Ate a proxima, aventureiro!\n");
+    return 0;
+}
