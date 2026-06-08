@@ -65,3 +65,5 @@ No NPC da Vila, você deve escolher uma das três armas abaixo. O padrão de ata
 * **Cajado:** Ataca simultaneamente as 8 células adjacentes ao redor do jogador (independe da direção).
 
 ---
+Uso de ia: Sim
+Modo: para aprender struct, define e void
