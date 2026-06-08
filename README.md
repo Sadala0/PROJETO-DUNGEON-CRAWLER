@@ -66,4 +66,5 @@ No NPC da Vila, você deve escolher uma das três armas abaixo. O padrão de ata
 
 ---
 Uso de ia: Sim
+
 Modo: para aprender struct, define e void
